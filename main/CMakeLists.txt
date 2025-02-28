@@ -19,6 +19,7 @@ set(SOURCES "audio_codecs/audio_codec.cc"
             "ota.cc"
             "settings.cc"
             "background_task.cc"
+            "local_websocket_server.cc"    # 添加这一行
             "main.cc"
             )
 
@@ -150,6 +151,17 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${ASSETS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
+                    REQUIRES esp_http_server        # HTTP 服务器支持 (包含 WebSocket 支持)
+                             app_update            # OTA 和应用描述符支持
+                             esp_wifi              # WiFi 支持
+                             nvs_flash            # NVS Flash 存储
+                             json                 # JSON 解析
+                             78__esp-opus         # Opus 编解码器
+                             driver              # ESP32 驱动
+                             esp_timer           # ESP32 定时器
+                             spi_flash          # Flash 支持
+                             esp_system         # ESP32 系统功能
+                             freertos           # FreeRTOS
                     WHOLE_ARCHIVE
                     )
 

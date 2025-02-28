@@ -7,10 +7,15 @@
 #include "config.h"
 #include "iot/thing_manager.h"
 #include "led/single_led.h"
+#include "local_websocket_server.h"
+#include "settings.h"
+#include "system_info.h"
 
 #include <wifi_station.h>
 #include <esp_log.h>
 #include <driver/i2c_master.h>
+#include <esp_wifi.h>
+#include <freertos/event_groups.h>
 
 #define TAG "CompactWifiBoard"
 
@@ -94,6 +99,83 @@ private:
         thing_manager.AddThing(iot::CreateThing("Lamp"));
     }
 
+    static void WebSocketServerTask(void* arg) {
+        auto* board = static_cast<CompactWifiBoard*>(arg);
+        
+        // 等待一小段时间确保系统初始化完成
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        auto& server = LocalWebsocketServer::GetInstance();
+        
+        // 配置读取回调
+        server.OnGetConfig([board]() {
+            cJSON* root = cJSON_CreateObject();
+            if (!root) return std::string("{\"error\":\"Failed to create JSON object\"}");
+            
+            // WiFi 配置
+            Settings wifi_settings("wifi");
+            cJSON_AddStringToObject(root, "ssid", wifi_settings.GetString("ssid", "").c_str());
+            cJSON_AddStringToObject(root, "hostname", wifi_settings.GetString("hostname", "xiaozhi").c_str());
+            cJSON_AddBoolToObject(root, "wifi_connected", WifiStation::GetInstance().IsConnected());
+            
+            // 设备信息
+            cJSON_AddStringToObject(root, "mac_address", SystemInfo::GetMacAddress().c_str());
+            cJSON_AddStringToObject(root, "chip_model", SystemInfo::GetChipModelName().c_str());
+            cJSON_AddNumberToObject(root, "free_heap", SystemInfo::GetFreeHeapSize());
+            
+            char* json_str = cJSON_PrintUnformatted(root);
+            std::string result = json_str;
+            free(json_str);
+            cJSON_Delete(root);
+            return result;
+        });
+
+        // 配置设置回调
+        server.OnSetConfig([](const std::string& config_str) {
+            cJSON* root = cJSON_Parse(config_str.c_str());
+            if (!root) return false;
+
+            bool success = true;
+            Settings wifi_settings("wifi");
+            cJSON* ssid = cJSON_GetObjectItem(root, "ssid");
+            cJSON* password = cJSON_GetObjectItem(root, "password");
+            cJSON* hostname = cJSON_GetObjectItem(root, "hostname");
+
+            if (ssid && ssid->valuestring) {
+                wifi_settings.SetString("ssid", ssid->valuestring);
+                success = true;
+            }
+            if (password && password->valuestring) {
+                wifi_settings.SetString("password", password->valuestring);
+                success = true;
+            }
+            if (hostname && hostname->valuestring) {
+                wifi_settings.SetString("hostname", hostname->valuestring);
+                success = true;
+            }
+
+            cJSON_Delete(root);
+            return success;
+        });
+
+        // 重启回调
+        server.OnReboot([]() {
+            esp_restart();
+        });
+
+        // 启动服务器
+        if (!server.Start(3000)) {
+            ESP_LOGE(TAG, "Failed to start WebSocket server");
+        } else {
+            ESP_LOGI(TAG, "WebSocket server started on port 3000");
+        }
+
+        // 任务完成后进入无限循环
+        while (true) {
+            vTaskDelay(portMAX_DELAY);
+        }
+    }
+
 public:
     CompactWifiBoard() :
         boot_button_(BOOT_BUTTON_GPIO),
@@ -103,6 +185,9 @@ public:
         InitializeDisplayI2c();
         InitializeButtons();
         InitializeIot();
+        
+        // 在网络栈初始化后启动 WebSocket 服务器
+        xTaskCreate(WebSocketServerTask, "ws_init", 4096, this, 5, nullptr);
     }
 
     virtual Led* GetLed() override {
