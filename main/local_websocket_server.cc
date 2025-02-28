@@ -4,10 +4,39 @@
 #include <cJSON.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha1.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <string.h>
+#include "settings.h"  // 添加 settings.h 头文件
 
 #define TAG "WebSocketServer"
 #define WS_PING_INTERVAL_MS 30000  // 30秒发送一次 ping
 #define WS_PING_TIMEOUT_MS 120000  // 120秒没有响应则断开连接
+
+// 添加 WebSocket 帧解析相关的结构和常量
+#define WS_FIN 0x80
+#define WS_OPCODE_MASK 0x0F
+#define WS_MASK 0x80
+#define WS_LENGTH_MASK 0x7F
+
+#define WS_OPCODE_CONTINUATION 0x0
+#define WS_OPCODE_TEXT 0x1
+#define WS_OPCODE_BINARY 0x2
+#define WS_OPCODE_CLOSE 0x8
+#define WS_OPCODE_PING 0x9
+#define WS_OPCODE_PONG 0xA
+
+struct ws_frame_info_t {
+    bool fin;
+    uint8_t opcode;
+    bool mask;
+    uint64_t payload_length;
+    uint8_t mask_key[4];
+};
+
+// 添加函数前向声明
+static esp_err_t SendWebSocketMessage(int sock, const char* message, size_t len);
+static esp_err_t HandleJsonMessage(int sock, const char* message);
 
 // 生成 WebSocket 接受密钥
 static void GenerateAcceptKey(const char* client_key, char* accept_key) {
@@ -32,7 +61,161 @@ static void GenerateAcceptKey(const char* client_key, char* accept_key) {
     accept_key[out_len] = '\0';
 }
 
-// WebSocket 处理回调
+// 添加 WebSocket 帧处理函数
+static esp_err_t HandleWebSocketFrame(httpd_req_t *req) {
+    uint8_t buf[1024];
+    ws_frame_info_t frame = {};
+    
+    // 设置socket为非阻塞模式
+    int sock = httpd_req_to_sockfd(req);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Failed to get socket fd");
+        return ESP_FAIL;
+    }
+
+    // 设置更长的接收超时时间
+    struct timeval tv;
+    tv.tv_sec = 30;  // 30秒超时
+    tv.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        ESP_LOGE(TAG, "Failed to set socket receive timeout");
+        return ESP_FAIL;
+    }
+    
+    // 读取前两个字节以获取基本信息
+    int ret = recv(sock, buf, 2, 0);
+    ESP_LOGI(TAG, "Read header bytes: %d", ret);
+    if (ret == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ESP_LOGW(TAG, "Socket timeout, continuing...");
+            return ESP_OK;  // 超时时继续等待
+        }
+        ESP_LOGE(TAG, "Failed to read frame header: errno %d", errno);
+        return ESP_FAIL;
+    }
+    if (ret == 0) {
+        ESP_LOGI(TAG, "Client closed connection");
+        return ESP_FAIL;
+    }
+    
+    frame.fin = (buf[0] & WS_FIN) != 0;
+    frame.opcode = buf[0] & WS_OPCODE_MASK;
+    frame.mask = (buf[1] & WS_MASK) != 0;
+    frame.payload_length = buf[1] & WS_LENGTH_MASK;
+    
+    ESP_LOGI(TAG, "Frame info - FIN: %d, Opcode: 0x%x, MASK: %d, Length: %llu",
+             frame.fin, frame.opcode, frame.mask, frame.payload_length);
+    
+    // 处理扩展长度
+    if (frame.payload_length == 126) {
+        ret = recv(sock, buf + 2, 2, 0);
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "Failed to read extended length (16-bit)");
+            return ESP_FAIL;
+        }
+        frame.payload_length = (buf[2] << 8) | buf[3];
+        ESP_LOGI(TAG, "Extended length (16-bit): %llu", frame.payload_length);
+    } else if (frame.payload_length == 127) {
+        ret = recv(sock, buf + 2, 8, 0);
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "Failed to read extended length (64-bit)");
+            return ESP_FAIL;
+        }
+        frame.payload_length = 0;
+        for (int i = 0; i < 8; i++) {
+            frame.payload_length = (frame.payload_length << 8) | buf[2 + i];
+        }
+        ESP_LOGI(TAG, "Extended length (64-bit): %llu", frame.payload_length);
+    }
+    
+    // 读取掩码
+    if (frame.mask) {
+        ret = recv(sock, frame.mask_key, 4, 0);
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "Failed to read mask key");
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Mask key: %02x %02x %02x %02x",
+                 frame.mask_key[0], frame.mask_key[1],
+                 frame.mask_key[2], frame.mask_key[3]);
+    }
+    
+    // 读取和处理负载数据
+    if (frame.payload_length > 0) {
+        if (frame.payload_length > sizeof(buf)) {
+            ESP_LOGE(TAG, "Payload too large: %llu", frame.payload_length);
+            return ESP_FAIL;
+        }
+        
+        size_t remaining = frame.payload_length;
+        size_t total_read = 0;
+        
+        while (remaining > 0) {
+            size_t to_read = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
+            ret = recv(sock, buf + total_read, to_read, 0);
+            ESP_LOGI(TAG, "Read payload bytes: %d of %zu", ret, to_read);
+            
+            if (ret <= 0) {
+                ESP_LOGE(TAG, "Failed to read payload data");
+                return ESP_FAIL;
+            }
+            
+            total_read += ret;
+            remaining -= ret;
+        }
+        
+        // 解除掩码
+        if (frame.mask) {
+            for (size_t i = 0; i < total_read; i++) {
+                buf[i] ^= frame.mask_key[i % 4];
+            }
+        }
+        
+        // 确保字符串结束
+        buf[total_read] = '\0';
+        
+        // 处理数据
+        switch (frame.opcode) {
+            case WS_OPCODE_TEXT: {
+                ESP_LOGI(TAG, "Received text message: %s", buf);
+                // 确保字符串正确终止
+                buf[total_read] = '\0';
+                // 处理 JSON 消息
+                if (HandleJsonMessage(sock, (char*)buf) != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to handle JSON message");
+                }
+                break;
+            }
+            
+            case WS_OPCODE_BINARY:
+                ESP_LOGI(TAG, "Received binary message (%zu bytes)", total_read);
+                break;
+                
+            case WS_OPCODE_PING: {
+                ESP_LOGI(TAG, "Received WebSocket ping frame, sending pong");
+                uint8_t pong[2] = {(uint8_t)(WS_FIN | WS_OPCODE_PONG), 0};
+                send(sock, pong, 2, 0);
+                break;
+            }
+                
+            case WS_OPCODE_PONG:
+                ESP_LOGI(TAG, "Received WebSocket pong frame");
+                break;
+                
+            case WS_OPCODE_CLOSE:
+                ESP_LOGI(TAG, "Received close frame");
+                return ESP_FAIL;
+                
+            default:
+                ESP_LOGW(TAG, "Unknown opcode: 0x%x", frame.opcode);
+                break;
+        }
+    }
+    
+    return ESP_OK;
+}
+
+// 修改 HandleWebSocket 函数
 esp_err_t LocalWebsocketServer::HandleWebSocket(httpd_req_t *req) {
     ESP_LOGI(TAG, "\n=== WebSocket handler ===");
     ESP_LOGI(TAG, "URI: %s", req->uri);
@@ -101,7 +284,18 @@ esp_err_t LocalWebsocketServer::HandleWebSocket(httpd_req_t *req) {
         err = httpd_resp_send(req, NULL, 0);
         ESP_LOGI(TAG, "Response sent: %d", err);
         
-        return err;
+        // 握手成功后，进入帧处理循环
+        while (true) {
+            esp_err_t ret = HandleWebSocketFrame(req);
+            if (ret == ESP_FAIL) {
+                ESP_LOGI(TAG, "WebSocket connection closed");
+                break;
+            }
+            // 添加短暂延时，避免CPU占用过高
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        
+        return ESP_OK;
     }
     
     ESP_LOGI(TAG, "Invalid WebSocket request");
@@ -124,6 +318,156 @@ static esp_err_t HandleAllRequests(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// 添加发送 WebSocket 消息的辅助函数
+static esp_err_t SendWebSocketMessage(int sock, const char* message, size_t len) {
+    ESP_LOGI(TAG, "Sending message: %s", message);  // 添加日志
+    
+    // 计算帧头大小
+    size_t header_len = 2;
+    if (len > 125) {
+        header_len += (len > 65535) ? 8 : 2;
+    }
+    
+    // 分配帧缓冲区
+    uint8_t* frame = (uint8_t*)malloc(header_len + len);
+    if (!frame) {
+        ESP_LOGE(TAG, "Failed to allocate frame buffer");
+        return ESP_FAIL;
+    }
+    
+    // 设置帧头
+    frame[0] = WS_FIN | WS_OPCODE_TEXT;
+    
+    // 设置长度
+    if (len <= 125) {
+        frame[1] = len;
+    } else if (len <= 65535) {
+        frame[1] = 126;
+        frame[2] = (len >> 8) & 0xFF;
+        frame[3] = len & 0xFF;
+    } else {
+        frame[1] = 127;
+        for (int i = 0; i < 8; i++) {
+            frame[2 + i] = (len >> ((7 - i) * 8)) & 0xFF;
+        }
+    }
+    
+    // 复制消息数据
+    memcpy(frame + header_len, message, len);
+    
+    // 发送帧
+    ESP_LOGI(TAG, "Sending frame with length: %d", header_len + len);  // 添加日志
+    int ret = send(sock, frame, header_len + len, 0);
+    if (ret < 0) {
+        ESP_LOGE(TAG, "Failed to send WebSocket message: errno %d", errno);
+    } else {
+        ESP_LOGI(TAG, "Successfully sent %d bytes", ret);
+    }
+    
+    free(frame);
+    return (ret < 0) ? ESP_FAIL : ESP_OK;
+}
+
+// 处理 JSON 消息
+static esp_err_t HandleJsonMessage(int sock, const char* message) {
+    ESP_LOGI(TAG, "Processing JSON message: %s", message);
+    
+    // 处理简单的 ping 消息
+    if (strcmp(message, "ping") == 0) {
+        const char* pong_response = "pong";
+        return SendWebSocketMessage(sock, pong_response, strlen(pong_response));
+    }
+    
+    cJSON* root = cJSON_Parse(message);
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse JSON message: %s", cJSON_GetErrorPtr());
+        return ESP_FAIL;
+    }
+    
+    cJSON* type = cJSON_GetObjectItem(root, "type");
+    if (!type || !cJSON_IsString(type)) {
+        ESP_LOGE(TAG, "Missing or invalid 'type' field");
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Message type: %s", type->valuestring);
+    
+    if (strcmp(type->valuestring, "get_config") == 0) {
+        // 创建响应
+        cJSON* response = cJSON_CreateObject();
+        if (!response) {
+            ESP_LOGE(TAG, "Failed to create response object");
+            cJSON_Delete(root);
+            return ESP_FAIL;
+        }
+        
+        cJSON_AddStringToObject(response, "type", "get_config");
+        
+        // 添加配置数据
+        cJSON* config = cJSON_CreateObject();
+        if (!config) {
+            ESP_LOGE(TAG, "Failed to create config object");
+            cJSON_Delete(response);
+            cJSON_Delete(root);
+            return ESP_FAIL;
+        }
+        
+        // 从 Settings 获取实际配置
+        Settings settings("xiaozhi", false);  // 只读模式打开配置
+        
+        // 添加 WiFi 配置
+        cJSON_AddStringToObject(config, "ssid", settings.GetString("wifi_ssid", "").c_str());
+        cJSON_AddStringToObject(config, "password", settings.GetString("wifi_password", "").c_str());
+        cJSON_AddStringToObject(config, "hostname", settings.GetString("hostname", "xiaozhi").c_str());
+        
+        // 添加音频配置
+        cJSON_AddNumberToObject(config, "volume", settings.GetInt("volume", 50));
+        cJSON_AddNumberToObject(config, "mute", settings.GetInt("mute", 0));
+        
+        // 添加其他配置
+        cJSON_AddStringToObject(config, "device_name", settings.GetString("device_name", "xiaozhi").c_str());
+        cJSON_AddStringToObject(config, "device_id", settings.GetString("device_id", "").c_str());
+        
+        // 添加配置对象到响应
+        cJSON_AddItemToObject(response, "config", config);
+        
+        // 转换为字符串并发送
+        char* json_str = cJSON_PrintUnformatted(response);
+        if (json_str) {
+            ESP_LOGI(TAG, "Sending config response: %s", json_str);
+            esp_err_t ret = SendWebSocketMessage(sock, json_str, strlen(json_str));
+            free(json_str);
+            cJSON_Delete(response);
+            cJSON_Delete(root);
+            return ret;
+        }
+        
+        ESP_LOGE(TAG, "Failed to convert response to string");
+        cJSON_Delete(response);
+    } else if (strcmp(type->valuestring, "ping") == 0) {
+        // 处理 JSON 格式的 ping
+        cJSON* response = cJSON_CreateObject();
+        if (response) {
+            cJSON_AddStringToObject(response, "type", "pong");
+            char* json_str = cJSON_PrintUnformatted(response);
+            if (json_str) {
+                esp_err_t ret = SendWebSocketMessage(sock, json_str, strlen(json_str));
+                free(json_str);
+                cJSON_Delete(response);
+                cJSON_Delete(root);
+                return ret;
+            }
+            cJSON_Delete(response);
+        }
+    } else {
+        ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
+    }
+    
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 // 启动服务器
 bool LocalWebsocketServer::Start(uint16_t port) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -131,16 +475,18 @@ bool LocalWebsocketServer::Start(uint16_t port) {
     config.lru_purge_enable = true;
     config.max_uri_handlers = 8;
     config.max_resp_headers = 8;
-    config.recv_wait_timeout = 10;
-    config.send_wait_timeout = 10;
-    config.max_open_sockets = 3;     // 增加最大连接数
-    config.backlog_conn = 5;         // 增加等待队列
-    config.core_id = 0;             // 指定核心
-    config.stack_size = 8192;       // 增加栈大小
+    config.recv_wait_timeout = 30;      // 增加接收超时时间到30秒
+    config.send_wait_timeout = 30;      // 增加发送超时时间到30秒
+    config.max_open_sockets = 3;        // 增加最大连接数
+    config.backlog_conn = 5;            // 增加等待队列
+    config.core_id = 0;                 // 指定核心
+    config.stack_size = 8192;           // 增加栈大小
     
     ESP_LOGI(TAG, "Starting server with config:");
-    ESP_LOGI(TAG, "Port: %d, Max handlers: %d, Stack: %d",
-             config.server_port, config.max_uri_handlers, config.stack_size);
+    ESP_LOGI(TAG, "Port: %d, Max handlers: %d, Stack: %d, Timeouts: %d/%d",
+             config.server_port, config.max_uri_handlers, 
+             config.stack_size, config.recv_wait_timeout, 
+             config.send_wait_timeout);
     
     if (httpd_start(&server_, &config) == ESP_OK) {
         // 注册 WebSocket 处理程序
