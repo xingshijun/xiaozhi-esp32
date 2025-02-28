@@ -1,5 +1,14 @@
 #include "local_websocket_server.h"
+#include "settings.h"
+#include "wifi_station.h"
+#include "system_info.h"
+#include "board.h"
+#include "application.h"
+// #include "audio_codecs/audio_codec.h"
+
 #include <esp_log.h>
+#include <esp_http_server.h>
+#include <esp_wifi.h>
 #include <cstring>
 #include <cJSON.h>
 #include <mbedtls/base64.h>
@@ -7,7 +16,6 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <string.h>
-#include "settings.h"  // 添加 settings.h 头文件
 
 #define TAG "WebSocketServer"
 #define WS_PING_INTERVAL_MS 30000  // 30秒发送一次 ping
@@ -383,7 +391,7 @@ static esp_err_t HandleJsonMessage(int sock, const char* message) {
         ESP_LOGE(TAG, "Failed to parse JSON message: %s", cJSON_GetErrorPtr());
         return ESP_FAIL;
     }
-    
+
     cJSON* type = cJSON_GetObjectItem(root, "type");
     if (!type || !cJSON_IsString(type)) {
         ESP_LOGE(TAG, "Missing or invalid 'type' field");
@@ -392,7 +400,7 @@ static esp_err_t HandleJsonMessage(int sock, const char* message) {
     }
     
     ESP_LOGI(TAG, "Message type: %s", type->valuestring);
-    
+
     if (strcmp(type->valuestring, "get_config") == 0) {
         // 创建响应
         cJSON* response = cJSON_CreateObject();
@@ -413,21 +421,26 @@ static esp_err_t HandleJsonMessage(int sock, const char* message) {
             return ESP_FAIL;
         }
         
-        // 从 Settings 获取实际配置
-        Settings settings("xiaozhi", false);  // 只读模式打开配置
+        // 从 Settings 获取 WiFi 配置
+        Settings wifi_settings("wifi");
+        cJSON_AddStringToObject(config, "ssid", wifi_settings.GetString("ssid", "").c_str());
+        cJSON_AddStringToObject(config, "password", wifi_settings.GetString("password", "").c_str());
+        cJSON_AddStringToObject(config, "hostname", wifi_settings.GetString("hostname", "xiaozhi").c_str());
         
-        // 添加 WiFi 配置
-        cJSON_AddStringToObject(config, "ssid", settings.GetString("wifi_ssid", "").c_str());
-        cJSON_AddStringToObject(config, "password", settings.GetString("wifi_password", "").c_str());
-        cJSON_AddStringToObject(config, "hostname", settings.GetString("hostname", "xiaozhi").c_str());
+        // 添加 WiFi 连接状态
+        cJSON_AddBoolToObject(config, "wifi_connected", WifiStation::GetInstance().IsConnected());
+        
+        // 添加系统信息
+        cJSON_AddStringToObject(config, "mac_address", SystemInfo::GetMacAddress().c_str());
+        cJSON_AddStringToObject(config, "chip_model", SystemInfo::GetChipModelName().c_str());
+        cJSON_AddNumberToObject(config, "free_heap", SystemInfo::GetFreeHeapSize());
         
         // 添加音频配置
-        cJSON_AddNumberToObject(config, "volume", settings.GetInt("volume", 50));
-        cJSON_AddNumberToObject(config, "mute", settings.GetInt("mute", 0));
-        
-        // 添加其他配置
-        cJSON_AddStringToObject(config, "device_name", settings.GetString("device_name", "xiaozhi").c_str());
-        cJSON_AddStringToObject(config, "device_id", settings.GetString("device_id", "").c_str());
+        // Board& board = Application::GetInstance().board;
+        // auto* codec = board.GetAudioCodec();
+        // if (codec) {
+        //     cJSON_AddNumberToObject(config, "volume", codec->output_volume());
+        // }
         
         // 添加配置对象到响应
         cJSON_AddItemToObject(response, "config", config);

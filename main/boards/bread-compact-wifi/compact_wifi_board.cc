@@ -16,6 +16,7 @@
 #include <driver/i2c_master.h>
 #include <esp_wifi.h>
 #include <freertos/event_groups.h>
+#include <esp_system.h>
 
 #define TAG "CompactWifiBoard"
 
@@ -158,10 +159,8 @@ private:
             return success;
         });
 
-        // 重启回调
-        server.OnReboot([]() {
-            esp_restart();
-        });
+        // 重启回调 - 修复语法
+        server.OnReboot([](){ esp_restart(); });
 
         // 启动服务器
         if (!server.Start(3000)) {

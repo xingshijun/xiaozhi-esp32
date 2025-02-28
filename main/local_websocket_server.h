@@ -17,6 +17,9 @@ public:
     void OnGetConfig(std::function<std::string()> callback) { get_config_callback_ = callback; }
     void OnSetConfig(std::function<bool(const std::string&)> callback) { set_config_callback_ = callback; }
     void OnReboot(std::function<void()> callback) { reboot_callback_ = callback; }
+    
+    // 获取回调函数
+    std::function<void()> GetRebootCallback() const { return reboot_callback_; }
 
 private:
     LocalWebsocketServer() = default;
