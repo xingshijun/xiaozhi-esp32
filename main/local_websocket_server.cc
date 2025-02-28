@@ -34,197 +34,93 @@ static void GenerateAcceptKey(const char* client_key, char* accept_key) {
 
 // WebSocket 处理回调
 esp_err_t LocalWebsocketServer::HandleWebSocket(httpd_req_t *req) {
-    char* header = nullptr;
-    size_t header_len;
-
-    // 检查 Connection 头
-    header_len = httpd_req_get_hdr_value_len(req, "Connection");
-    if (header_len > 0) {
-        header = (char*)malloc(header_len + 1);
-        if (httpd_req_get_hdr_value_str(req, "Connection", header, header_len + 1) == ESP_OK) {
-            if (strcasestr(header, "upgrade") == nullptr) {
-                free(header);
-                return ESP_FAIL;
-            }
-        }
-        free(header);
-    }
-
-    // 检查 Upgrade 头
-    header_len = httpd_req_get_hdr_value_len(req, "Upgrade");
-    if (header_len > 0) {
-        header = (char*)malloc(header_len + 1);
-        if (httpd_req_get_hdr_value_str(req, "Upgrade", header, header_len + 1) == ESP_OK) {
-            if (strcasecmp(header, "websocket") != 0) {
-                free(header);
-                return ESP_FAIL;
-            }
-        }
-        free(header);
-    }
-
-    // 获取 WebSocket 版本
-    header_len = httpd_req_get_hdr_value_len(req, "Sec-WebSocket-Version");
-    if (header_len > 0) {
-        header = (char*)malloc(header_len + 1);
-        if (httpd_req_get_hdr_value_str(req, "Sec-WebSocket-Version", header, header_len + 1) == ESP_OK) {
-            if (strcmp(header, "13") != 0) {
-                free(header);
-                return ESP_FAIL;
-            }
-        }
-        free(header);
-    }
-
-    // 获取客户端密钥
-    header_len = httpd_req_get_hdr_value_len(req, "Sec-WebSocket-Key");
-    if (header_len > 0) {
-        char client_key[32] = {0};
-        char accept_key[32] = {0};
-        
-        if (httpd_req_get_hdr_value_str(req, "Sec-WebSocket-Key", client_key, sizeof(client_key)) == ESP_OK) {
-            // 生成接受密钥
-            GenerateAcceptKey(client_key, accept_key);
-            
-            // 设置响应头
-            httpd_resp_set_status(req, "101 Switching Protocols");
-            httpd_resp_set_hdr(req, "Upgrade", "websocket");
-            httpd_resp_set_hdr(req, "Connection", "Upgrade");
-            httpd_resp_set_hdr(req, "Sec-WebSocket-Accept", accept_key);
-            
-            // 发送空响应体完成握手
-            httpd_resp_send(req, nullptr, 0);
-            
-            ESP_LOGI(TAG, "WebSocket handshake successful");
-            return ESP_OK;
-        }
-    }
-
-    // 如果是数据帧
-    if (req->content_len > 0) {
-        uint8_t *buf = (uint8_t*)malloc(req->content_len);
-        if (!buf) {
-            return ESP_ERR_NO_MEM;
-        }
-
-        int ret = httpd_req_recv(req, (char*)buf, req->content_len);
-        if (ret <= 0) {
-            free(buf);
-            return ESP_FAIL;
-        }
-
-        // 处理 WebSocket 数据帧
-        if (buf[0] & 0x80) {  // FIN bit set
-            uint8_t opcode = buf[0] & 0x0F;
-            uint8_t mask = buf[1] & 0x80;
-            uint64_t payload_len = buf[1] & 0x7F;
-            size_t header_len = 2;
-
-            // 处理扩展长度
-            if (payload_len == 126) {
-                payload_len = (buf[2] << 8) | buf[3];
-                header_len += 2;
-            } else if (payload_len == 127) {
-                payload_len = 0;
-                for (int i = 0; i < 8; i++) {
-                    payload_len = (payload_len << 8) | buf[2 + i];
-                }
-                header_len += 8;
-            }
-
-            // 处理掩码
-            uint8_t mask_key[4] = {0};
-            if (mask) {
-                memcpy(mask_key, buf + header_len, 4);
-                header_len += 4;
-            }
-
-            // 解码数据
-            for (size_t i = 0; i < payload_len; i++) {
-                buf[header_len + i] ^= mask_key[i % 4];
-            }
-
-            // 处理不同类型的帧
-            switch (opcode) {
-                case 0x1:  // 文本帧
-                    {
-                        buf[header_len + payload_len] = 0;  // Null-terminate
-                        char* payload = (char*)(buf + header_len);
-                        
-                        if (strcmp(payload, "ping") == 0) {
-                            // 发送 pong 响应
-                            const char* pong = "pong";
-                            httpd_resp_send(req, pong, strlen(pong));
-                        } else {
-                            // 处理 JSON 消息
-                            auto& server = LocalWebsocketServer::GetInstance();
-                            cJSON* root = cJSON_Parse(payload);
-                            if (root) {
-                                cJSON* type = cJSON_GetObjectItem(root, "type");
-                                if (type && type->valuestring) {
-                                    std::string type_str = type->valuestring;
-                                    std::string response;
-                                    
-                                    if (type_str == "get_config" && server.get_config_callback_) {
-                                        std::string config_data = server.get_config_callback_();
-                                        response = "{\"type\":\"get_config\", \"data\":" + config_data + "}";
-                                    }
-                                    else if (type_str == "set_config" && server.set_config_callback_) {
-                                        cJSON* config = cJSON_GetObjectItem(root, "config");
-                                        if (config) {
-                                            char* config_str = cJSON_PrintUnformatted(config);
-                                            if (config_str) {
-                                                bool success = server.set_config_callback_(config_str);
-                                                free(config_str);
-                                                response = "{\"type\":\"set_config\", \"status\":\"" + std::string(success ? "success" : "failed") + "\"}";
-                                            }
-                                        }
-                                    }
-                                    else if (type_str == "reboot" && server.reboot_callback_) {
-                                        response = "{\"type\":\"reboot\", \"status\":\"success\"}";
-                                        server.reboot_callback_();
-                                    }
-
-                                    // 发送响应
-                                    if (!response.empty()) {
-                                        // 构造 WebSocket 文本帧
-                                        size_t frame_len = response.length() + 2;
-                                        uint8_t* frame = (uint8_t*)malloc(frame_len);
-                                        if (frame) {
-                                            frame[0] = 0x81;  // FIN + Text frame
-                                            frame[1] = response.length();
-                                            memcpy(frame + 2, response.c_str(), response.length());
-                                            httpd_resp_send(req, (const char*)frame, frame_len);
-                                            free(frame);
-                                        }
-                                    }
-                                }
-                                cJSON_Delete(root);
-                            }
-                        }
-                    }
-                    break;
+    ESP_LOGI(TAG, "\n=== WebSocket handler ===");
+    ESP_LOGI(TAG, "URI: %s", req->uri);
+    ESP_LOGI(TAG, "Method: %s", (req->method == HTTP_GET) ? "GET" : "OTHER");
+    
+    // 打印所有头部
+    const char* headers[] = {
+        "Host",
+        "Connection",
+        "Upgrade",
+        "Sec-WebSocket-Key",
+        "Sec-WebSocket-Version",
+        "Sec-WebSocket-Protocol",
+        "User-Agent",
+        "Accept",
+        "Accept-Encoding",
+        "Accept-Language",
+        "Origin"
+    };
+    
+    bool is_websocket = false;
+    char ws_key[64] = {0};
+    
+    for (const char* header : headers) {
+        size_t len = httpd_req_get_hdr_value_len(req, header);
+        if (len > 0) {
+            char* value = (char*)malloc(len + 1);
+            if (value) {
+                if (httpd_req_get_hdr_value_str(req, header, value, len + 1) == ESP_OK) {
+                    ESP_LOGI(TAG, "Header %s: %s", header, value);
                     
-                case 0x9:  // Ping
-                    {
-                        // 发送 Pong
-                        const char* pong = "pong";
-                        httpd_resp_send(req, pong, strlen(pong));
+                    if (strcmp(header, "Upgrade") == 0 && 
+                        strcasecmp(value, "websocket") == 0) {
+                        is_websocket = true;
                     }
-                    break;
+                    
+                    if (strcmp(header, "Sec-WebSocket-Key") == 0) {
+                        strncpy(ws_key, value, sizeof(ws_key) - 1);
+                    }
+                }
+                free(value);
             }
         }
-        
-        free(buf);
     }
-
-    return ESP_OK;
+    
+    if (req->method == HTTP_GET && is_websocket && strlen(ws_key) > 0) {
+        ESP_LOGI(TAG, "Valid WebSocket request detected");
+        
+        char accept_key[32] = {0};
+        GenerateAcceptKey(ws_key, accept_key);
+        ESP_LOGI(TAG, "Accept key: %s", accept_key);
+        
+        httpd_resp_set_status(req, "101 Switching Protocols");
+        httpd_resp_set_type(req, "text/plain");
+        
+        esp_err_t err;
+        err = httpd_resp_set_hdr(req, "Upgrade", "websocket");
+        ESP_LOGI(TAG, "Set Upgrade header: %d", err);
+        
+        err = httpd_resp_set_hdr(req, "Connection", "Upgrade");
+        ESP_LOGI(TAG, "Set Connection header: %d", err);
+        
+        err = httpd_resp_set_hdr(req, "Sec-WebSocket-Accept", accept_key);
+        ESP_LOGI(TAG, "Set Accept header: %d", err);
+        
+        err = httpd_resp_send(req, NULL, 0);
+        ESP_LOGI(TAG, "Response sent: %d", err);
+        
+        return err;
+    }
+    
+    ESP_LOGI(TAG, "Invalid WebSocket request");
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid WebSocket request");
+    return ESP_FAIL;
 }
 
-// HTTP 请求处理回调
-esp_err_t LocalWebsocketServer::HandleHttpRequest(httpd_req_t *req) {
-    const char* resp_str = "Welcome to ESP32 WebSocket Server";
-    httpd_resp_send(req, resp_str, strlen(resp_str));
+// 通用请求处理函数
+static esp_err_t HandleAllRequests(httpd_req_t *req) {
+    ESP_LOGI(TAG, "\n=== Catch-all handler ===");
+    ESP_LOGI(TAG, "URI: %s", req->uri);
+    ESP_LOGI(TAG, "Method: %s", (req->method == HTTP_GET) ? "GET" : "OTHER");
+    
+    // 打印所有头部
+    size_t headers_count = httpd_req_get_hdr_value_len(req, NULL);
+    ESP_LOGI(TAG, "Number of headers: %d", headers_count);
+    
+    // 返回 404
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
     return ESP_OK;
 }
 
@@ -232,33 +128,55 @@ esp_err_t LocalWebsocketServer::HandleHttpRequest(httpd_req_t *req) {
 bool LocalWebsocketServer::Start(uint16_t port) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
-    config.max_open_sockets = 4;
-    config.stack_size = 8192;
     config.lru_purge_enable = true;
-    config.recv_wait_timeout = WS_PING_TIMEOUT_MS / 1000;  // 设置接收超时时间
-
-    httpd_uri_t ws = {
-        .uri        = "/ws",
-        .method     = HTTP_GET,
-        .handler    = HandleWebSocket,
-        .user_ctx   = nullptr
-    };
-
-    httpd_uri_t uri = {
-        .uri        = "/",
-        .method     = HTTP_GET,
-        .handler    = HandleHttpRequest,
-        .user_ctx   = nullptr
-    };
-
+    config.max_uri_handlers = 8;
+    config.max_resp_headers = 8;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.max_open_sockets = 3;     // 增加最大连接数
+    config.backlog_conn = 5;         // 增加等待队列
+    config.core_id = 0;             // 指定核心
+    config.stack_size = 8192;       // 增加栈大小
+    
+    ESP_LOGI(TAG, "Starting server with config:");
+    ESP_LOGI(TAG, "Port: %d, Max handlers: %d, Stack: %d",
+             config.server_port, config.max_uri_handlers, config.stack_size);
+    
     if (httpd_start(&server_, &config) == ESP_OK) {
-        httpd_register_uri_handler(server_, &ws);
-        httpd_register_uri_handler(server_, &uri);
-        ESP_LOGI(TAG, "WebSocket server started on port %d", port);
+        // 注册 WebSocket 处理程序
+        httpd_uri_t ws = {
+            .uri = "/ws",
+            .method = HTTP_GET,
+            .handler = HandleWebSocket,
+            .user_ctx = nullptr
+        };
+        
+        ESP_LOGI(TAG, "Registering WebSocket handler");
+        esp_err_t ret = httpd_register_uri_handler(server_, &ws);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register WebSocket handler: %d", ret);
+            return false;
+        }
+        
+        // 注册一个通用处理程序来捕获所有请求
+        httpd_uri_t catch_all = {
+            .uri = "/*",
+            .method = HTTP_GET,
+            .handler = HandleAllRequests,
+            .user_ctx = nullptr
+        };
+        
+        ESP_LOGI(TAG, "Registering catch-all handler");
+        ret = httpd_register_uri_handler(server_, &catch_all);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register catch-all handler: %d", ret);
+        }
+        
+        ESP_LOGI(TAG, "Server started successfully");
         return true;
     }
-
-    ESP_LOGE(TAG, "Failed to start WebSocket server");
+    
+    ESP_LOGE(TAG, "Failed to start server");
     return false;
 }
 
