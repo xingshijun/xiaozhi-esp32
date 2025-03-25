@@ -67,6 +67,27 @@ void Settings::SetInt(const std::string& key, int32_t value) {
     }
 }
 
+bool Settings::GetBool(const std::string& key, bool default_value) {
+    if (nvs_handle_ == 0) {
+        return default_value;
+    }
+
+    uint8_t value;
+    if (nvs_get_u8(nvs_handle_, key.c_str(), &value) != ESP_OK) {
+        return default_value;
+    }
+    return value != 0;
+}
+
+void Settings::SetBool(const std::string& key, bool value) {
+    if (read_write_) {
+        ESP_ERROR_CHECK(nvs_set_u8(nvs_handle_, key.c_str(), value ? 1 : 0));
+        dirty_ = true;
+    } else {
+        ESP_LOGW(TAG, "Namespace %s is not open for writing", ns_.c_str());
+    }
+}
+
 void Settings::EraseKey(const std::string& key) {
     if (read_write_) {
         auto ret = nvs_erase_key(nvs_handle_, key.c_str());
@@ -84,4 +105,63 @@ void Settings::EraseAll() {
     } else {
         ESP_LOGW(TAG, "Namespace %s is not open for writing", ns_.c_str());
     }
+}
+
+std::vector<std::string> Settings::GetAllKeys() {
+    std::vector<std::string> keys;
+    if (nvs_handle_ == 0) {
+        return keys;
+    }
+
+    nvs_iterator_t it = nullptr;
+    esp_err_t res = nvs_entry_find(ns_.c_str(), NULL, NVS_TYPE_ANY, &it);
+    while (res == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        keys.push_back(info.key);
+        res = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    
+    return keys;
+}
+
+bool Settings::Contains(const std::string& key) {
+    if (nvs_handle_ == 0) {
+        return false;
+    }
+
+    nvs_type_t type;
+    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
+    return res == ESP_OK;
+}
+
+bool Settings::IsString(const std::string& key) {
+    if (nvs_handle_ == 0) {
+        return false;
+    }
+
+    nvs_type_t type;
+    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
+    return res == ESP_OK && type == NVS_TYPE_STR;
+}
+
+bool Settings::IsInt(const std::string& key) {
+    if (nvs_handle_ == 0) {
+        return false;
+    }
+
+    nvs_type_t type;
+    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
+    return res == ESP_OK && type == NVS_TYPE_I32;
+}
+
+bool Settings::IsBool(const std::string& key) {
+    if (nvs_handle_ == 0) {
+        return false;
+    }
+
+    nvs_type_t type;
+    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
+    return res == ESP_OK && type == NVS_TYPE_U8;
 }

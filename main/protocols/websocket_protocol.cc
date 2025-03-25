@@ -105,15 +105,61 @@ bool WebsocketProtocol::OpenAudioChannel() {
     }
 
     // Send hello message to describe the client
-    // keys: message type, version, audio_params (format, sample_rate, channels)
-    std::string message = "{";
-    message += "\"type\":\"hello\",";
-    message += "\"version\": 1,";
-    message += "\"transport\":\"websocket\",";
-    message += "\"audio_params\":{";
-    message += "\"format\":\"opus\", \"sample_rate\":16000, \"channels\":1, \"frame_duration\":" + std::to_string(OPUS_FRAME_DURATION_MS);
-    message += "}}";
-    websocket_->Send(message);
+    // 构建hello消息，添加custom配置信息
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "hello");
+    cJSON_AddNumberToObject(root, "version", 1);
+    cJSON_AddStringToObject(root, "transport", "websocket");
+    
+    // 添加音频参数
+    cJSON* audio_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(audio_params, "format", "opus");
+    cJSON_AddNumberToObject(audio_params, "sample_rate", 16000);
+    cJSON_AddNumberToObject(audio_params, "channels", 1);
+    cJSON_AddNumberToObject(audio_params, "frame_duration", OPUS_FRAME_DURATION_MS);
+    cJSON_AddItemToObject(root, "audio_params", audio_params);
+    
+    // 添加自定义配置
+    Settings custom_settings("custom");
+    std::vector<std::string> keys = custom_settings.GetAllKeys();
+    if (!keys.empty()) {
+        cJSON* custom_config = cJSON_CreateObject();
+        
+        for (const auto& key : keys) {
+            if (custom_settings.IsString(key)) {
+                cJSON_AddStringToObject(custom_config, key.c_str(), 
+                                        custom_settings.GetString(key, "").c_str());
+            } else if (custom_settings.IsInt(key)) {
+                cJSON_AddNumberToObject(custom_config, key.c_str(), 
+                                        custom_settings.GetInt(key, 0));
+            } else if (custom_settings.IsBool(key)) {
+                cJSON_AddBoolToObject(custom_config, key.c_str(), 
+                                      custom_settings.GetBool(key, false));
+            }
+        }
+        
+        cJSON_AddItemToObject(root, "custom_config", custom_config);
+    }
+    
+    // 转换为字符串并发送
+    char* json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        ESP_LOGI(TAG, "Sending hello with custom config: %s", json_str);
+        websocket_->Send(json_str);
+        free(json_str);
+    } else {
+        // 使用简单的字符串作为备用
+        std::string message = "{";
+        message += "\"type\":\"hello\",";
+        message += "\"version\": 1,";
+        message += "\"transport\":\"websocket\",";
+        message += "\"audio_params\":{";
+        message += "\"format\":\"opus\", \"sample_rate\":16000, \"channels\":1, \"frame_duration\":" + std::to_string(OPUS_FRAME_DURATION_MS);
+        message += "}}";
+        websocket_->Send(message);
+    }
+    
+    cJSON_Delete(root);
 
     // Wait for server hello
     EventBits_t bits = xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));

@@ -442,6 +442,29 @@ static esp_err_t HandleJsonMessage(int sock, const char* message) {
         //     cJSON_AddNumberToObject(config, "volume", codec->output_volume());
         // }
         
+        // 添加自定义配置
+        Settings custom_settings("custom");
+        std::vector<std::string> custom_keys = custom_settings.GetAllKeys();
+        
+        if (!custom_keys.empty()) {
+            cJSON* custom_config = cJSON_CreateObject();
+            if (custom_config) {
+                for (const auto& key : custom_keys) {
+                    if (custom_settings.IsString(key)) {
+                        cJSON_AddStringToObject(custom_config, key.c_str(), 
+                                               custom_settings.GetString(key, "").c_str());
+                    } else if (custom_settings.IsInt(key)) {
+                        cJSON_AddNumberToObject(custom_config, key.c_str(), 
+                                               custom_settings.GetInt(key, 0));
+                    } else if (custom_settings.IsBool(key)) {
+                        cJSON_AddBoolToObject(custom_config, key.c_str(), 
+                                             custom_settings.GetBool(key, false));
+                    }
+                }
+                cJSON_AddItemToObject(config, "custom", custom_config);
+            }
+        }
+        
         // 添加配置对象到响应
         cJSON_AddItemToObject(response, "config", config);
         
@@ -449,6 +472,131 @@ static esp_err_t HandleJsonMessage(int sock, const char* message) {
         char* json_str = cJSON_PrintUnformatted(response);
         if (json_str) {
             ESP_LOGI(TAG, "Sending config response: %s", json_str);
+            esp_err_t ret = SendWebSocketMessage(sock, json_str, strlen(json_str));
+            free(json_str);
+            cJSON_Delete(response);
+            cJSON_Delete(root);
+            return ret;
+        }
+        
+        ESP_LOGE(TAG, "Failed to convert response to string");
+        cJSON_Delete(response);
+    } else if (strcmp(type->valuestring, "set_config") == 0) {
+        // 处理set_config消息 - 添加自定义配置保存功能
+        cJSON* data = cJSON_GetObjectItem(root, "data");
+        if (!data || !cJSON_IsObject(data)) {
+            ESP_LOGE(TAG, "Missing or invalid 'data' field");
+            cJSON_Delete(root);
+            return ESP_FAIL;
+        }
+
+        // 处理WiFi配置
+        cJSON* wifi = cJSON_GetObjectItem(data, "wifi");
+        if (wifi && cJSON_IsObject(wifi)) {
+            Settings wifi_settings("wifi");
+            
+            cJSON* ssid = cJSON_GetObjectItem(wifi, "ssid");
+            if (ssid && cJSON_IsString(ssid)) {
+                wifi_settings.SetString("ssid", ssid->valuestring);
+                ESP_LOGI(TAG, "Saved WiFi SSID: %s", ssid->valuestring);
+            }
+            
+            cJSON* password = cJSON_GetObjectItem(wifi, "password");
+            if (password && cJSON_IsString(password)) {
+                wifi_settings.SetString("password", password->valuestring);
+                ESP_LOGI(TAG, "Saved WiFi password");
+            }
+            
+            cJSON* hostname = cJSON_GetObjectItem(wifi, "hostname");
+            if (hostname && cJSON_IsString(hostname)) {
+                wifi_settings.SetString("hostname", hostname->valuestring);
+                ESP_LOGI(TAG, "Saved hostname: %s", hostname->valuestring);
+            }
+        }
+        
+        // 处理自定义配置 - 可以存储在单独的设置组中
+        cJSON* custom = cJSON_GetObjectItem(data, "custom");
+        if (custom && cJSON_IsObject(custom)) {
+            Settings custom_settings("custom");
+            
+            // 遍历所有自定义配置项并保存
+            cJSON* item = NULL;
+            cJSON_ArrayForEach(item, custom) {
+                if (cJSON_IsString(item)) {
+                    custom_settings.SetString(item->string, item->valuestring);
+                    ESP_LOGI(TAG, "Saved custom string setting: %s = %s", item->string, item->valuestring);
+                } else if (cJSON_IsNumber(item)) {
+                    custom_settings.SetInt(item->string, item->valueint);
+                    ESP_LOGI(TAG, "Saved custom int setting: %s = %d", item->string, item->valueint);
+                } else if (cJSON_IsBool(item)) {
+                    custom_settings.SetBool(item->string, cJSON_IsTrue(item));
+                    ESP_LOGI(TAG, "Saved custom bool setting: %s = %d", item->string, cJSON_IsTrue(item));
+                }
+            }
+        }
+        
+        // 发送成功响应
+        cJSON* response = cJSON_CreateObject();
+        if (response) {
+            cJSON_AddStringToObject(response, "type", "set_config_response");
+            cJSON_AddBoolToObject(response, "success", true);
+            
+            char* json_str = cJSON_PrintUnformatted(response);
+            if (json_str) {
+                esp_err_t ret = SendWebSocketMessage(sock, json_str, strlen(json_str));
+                free(json_str);
+                cJSON_Delete(response);
+                cJSON_Delete(root);
+                return ret;
+            }
+            cJSON_Delete(response);
+        }
+    } else if (strcmp(type->valuestring, "get_custom_config") == 0) {
+        // 添加获取自定义配置的处理
+        Settings custom_settings("custom");
+        
+        // 创建响应
+        cJSON* response = cJSON_CreateObject();
+        if (!response) {
+            ESP_LOGE(TAG, "Failed to create response object");
+            cJSON_Delete(root);
+            return ESP_FAIL;
+        }
+        
+        cJSON_AddStringToObject(response, "type", "get_custom_config");
+        
+        // 添加所有自定义配置项
+        cJSON* config = cJSON_CreateObject();
+        if (!config) {
+            ESP_LOGE(TAG, "Failed to create config object");
+            cJSON_Delete(response);
+            cJSON_Delete(root);
+            return ESP_FAIL;
+        }
+        
+        // 获取所有键值对 (这里需要拓展Settings类功能，简化示例)
+        // 实际应用中，您可能需要读取指定的键
+        std::vector<std::string> keys = custom_settings.GetAllKeys();
+        for (const auto& key : keys) {
+            if (custom_settings.Contains(key)) {
+                // 尝试不同类型读取
+                if (custom_settings.IsString(key)) {
+                    cJSON_AddStringToObject(config, key.c_str(), custom_settings.GetString(key, "").c_str());
+                } else if (custom_settings.IsInt(key)) {
+                    cJSON_AddNumberToObject(config, key.c_str(), custom_settings.GetInt(key, 0));
+                } else if (custom_settings.IsBool(key)) {
+                    cJSON_AddBoolToObject(config, key.c_str(), custom_settings.GetBool(key, false));
+                }
+            }
+        }
+        
+        // 添加自定义配置到响应
+        cJSON_AddItemToObject(response, "config", config);
+        
+        // 转换为字符串并发送
+        char* json_str = cJSON_PrintUnformatted(response);
+        if (json_str) {
+            ESP_LOGI(TAG, "Sending custom config response: %s", json_str);
             esp_err_t ret = SendWebSocketMessage(sock, json_str, strlen(json_str));
             free(json_str);
             cJSON_Delete(response);
