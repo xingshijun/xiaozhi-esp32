@@ -4,7 +4,7 @@
 #include "system_info.h"
 #include "board.h"
 #include "application.h"
-// #include "audio_codecs/audio_codec.h"
+#include "audio_codecs/audio_codec.h"
 
 #include <esp_log.h>
 #include <esp_http_server.h>
@@ -424,6 +424,12 @@ static esp_err_t SendWebSocketMessage(int sock, const char *message, size_t len)
     return (ret < 0) ? ESP_FAIL : ESP_OK;
 }
 
+// 添加一个辅助函数来检查键的长度
+bool IsValidNvsKey(const char *key)
+{
+    return strlen(key) <= 15; // NVS 键的最大长度是 15 字符
+}
+
 // 处理 JSON 消息
 static esp_err_t HandleJsonMessage(int sock, const char *message)
 {
@@ -436,6 +442,7 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
         return SendWebSocketMessage(sock, pong_response, strlen(pong_response));
     }
 
+    // 解析 JSON 消息
     cJSON *root = cJSON_Parse(message);
     if (!root)
     {
@@ -490,42 +497,55 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
         cJSON_AddStringToObject(config, "chip_model", SystemInfo::GetChipModelName().c_str());
         cJSON_AddNumberToObject(config, "free_heap", SystemInfo::GetFreeHeapSize());
 
-        // 添加音频配置
-        // Board& board = Application::GetInstance().board;
-        // auto* codec = board.GetAudioCodec();
-        // if (codec) {
-        //     cJSON_AddNumberToObject(config, "volume", codec->output_volume());
-        // }
-
         // 添加自定义配置
         Settings custom_settings("custom");
-        std::vector<std::string> custom_keys = custom_settings.GetAllKeys();
-
-        if (!custom_keys.empty())
+        cJSON *custom_config = cJSON_CreateObject();
+        if (custom_config)
         {
-            cJSON *custom_config = cJSON_CreateObject();
-            if (custom_config)
+            // 获取实际设备音量
+            auto codec = Board::GetInstance().GetAudioCodec();
+            if (codec)
             {
-                for (const auto &key : custom_keys)
+                try
                 {
-                    if (custom_settings.IsString(key))
-                    {
-                        cJSON_AddStringToObject(custom_config, key.c_str(),
-                                                custom_settings.GetString(key, "").c_str());
-                    }
-                    else if (custom_settings.IsInt(key))
-                    {
-                        cJSON_AddNumberToObject(custom_config, key.c_str(),
-                                                custom_settings.GetInt(key, 0));
-                    }
-                    else if (custom_settings.IsBool(key))
-                    {
-                        cJSON_AddBoolToObject(custom_config, key.c_str(),
-                                              custom_settings.GetBool(key, false));
-                    }
+                    int current_volume = codec->output_volume();
+                    cJSON_AddNumberToObject(custom_config, "volume", current_volume);
+                    ESP_LOGI(TAG, "Current device volume: %d", current_volume);
                 }
-                cJSON_AddItemToObject(config, "custom", custom_config);
+                catch (const std::exception &e)
+                {
+                    ESP_LOGW(TAG, "Failed to get device volume: %s", e.what());
+                    // 如果获取失败，尝试从配置中读取
+                    int saved_volume = custom_settings.GetInt("volume", 50);
+                    cJSON_AddNumberToObject(custom_config, "volume", saved_volume);
+                }
             }
+
+            // 定义所有可能的键
+            const char *string_keys[] = {
+                "welcomeWord", "sleepWord", "waitWord", "roleWord",
+                "wakeupWord", "failWord", "voice", "botId", "apiToken"};
+            const char *int_keys[] = {
+                "emotion", "language", "speed", "tone", "model"};
+
+            // 获取字符串类型的配置
+            for (const char *key : string_keys)
+            {
+                std::string value = custom_settings.GetString(key, "");
+                cJSON_AddStringToObject(custom_config, key, value.c_str());
+                ESP_LOGI(TAG, "Read custom string setting: %s = %s", key, value.c_str());
+            }
+
+            // 获取整数类型的配置
+            for (const char *key : int_keys)
+            {
+                int value = custom_settings.GetInt(key, 0);
+                cJSON_AddNumberToObject(custom_config, key, value);
+                ESP_LOGI(TAG, "Read custom int setting: %s = %d", key, value);
+            }
+
+            // 将 custom_config 添加到 config 对象中
+            cJSON_AddItemToObject(config, "custom", custom_config);
         }
 
         // 添加配置对象到响应
@@ -561,7 +581,7 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
         cJSON *wifi = cJSON_GetObjectItem(data, "wifi");
         if (wifi && cJSON_IsObject(wifi))
         {
-            Settings wifi_settings("wifi");
+            Settings wifi_settings("wifi", true);
 
             cJSON *ssid = cJSON_GetObjectItem(wifi, "ssid");
             if (ssid && cJSON_IsString(ssid))
@@ -585,30 +605,75 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
             }
         }
 
-        // 处理自定义配置 - 可以存储在单独的设置组中
+        // 处理自定义配置
         cJSON *custom = cJSON_GetObjectItem(data, "custom");
         if (custom && cJSON_IsObject(custom))
         {
-            Settings custom_settings("custom");
+            Settings custom_settings("custom", true);
 
             // 遍历所有自定义配置项并保存
             cJSON *item = NULL;
             cJSON_ArrayForEach(item, custom)
             {
-                if (cJSON_IsString(item))
+                // 添加键长度检查
+                if (!IsValidNvsKey(item->string))
                 {
-                    custom_settings.SetString(item->string, item->valuestring);
-                    ESP_LOGI(TAG, "Saved custom string setting: %s = %s", item->string, item->valuestring);
+                    ESP_LOGW(TAG, "Key '%s' is too long (max 15 chars), skipping", item->string);
+                    continue;
                 }
-                else if (cJSON_IsNumber(item))
+
+                try
                 {
-                    custom_settings.SetInt(item->string, item->valueint);
-                    ESP_LOGI(TAG, "Saved custom int setting: %s = %d", item->string, item->valueint);
+                    // 特殊处理音量设置
+                    if (strcmp(item->string, "volume") == 0 && cJSON_IsNumber(item))
+                    {
+                        int volume = item->valueint;
+                        // 确保音量在有效范围内
+                        if (volume < 0)
+                            volume = 0;
+                        if (volume > 100)
+                            volume = 100;
+
+                        // 设置设备音量
+                        auto codec = Board::GetInstance().GetAudioCodec();
+                        if (codec)
+                        {
+                            try
+                            {
+                                codec->SetOutputVolume(volume);
+                                ESP_LOGI(TAG, "Set device volume to: %d", volume);
+                                // 成功设置后保存到配置中
+                                custom_settings.SetInt(item->string, volume);
+                            }
+                            catch (const std::exception &e)
+                            {
+                                ESP_LOGW(TAG, "Failed to set device volume: %s", e.what());
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // 其他配置项正常保存
+                        if (cJSON_IsString(item))
+                        {
+                            custom_settings.SetString(item->string, item->valuestring);
+                            ESP_LOGI(TAG, "Saved custom string setting: %s = %s", item->string, item->valuestring);
+                        }
+                        else if (cJSON_IsNumber(item))
+                        {
+                            custom_settings.SetInt(item->string, item->valueint);
+                            ESP_LOGI(TAG, "Saved custom int setting: %s = %d", item->string, item->valueint);
+                        }
+                        else if (cJSON_IsBool(item))
+                        {
+                            custom_settings.SetBool(item->string, cJSON_IsTrue(item));
+                            ESP_LOGI(TAG, "Saved custom bool setting: %s = %d", item->string, cJSON_IsTrue(item));
+                        }
+                    }
                 }
-                else if (cJSON_IsBool(item))
+                catch (const std::exception &e)
                 {
-                    custom_settings.SetBool(item->string, cJSON_IsTrue(item));
-                    ESP_LOGI(TAG, "Saved custom bool setting: %s = %d", item->string, cJSON_IsTrue(item));
+                    ESP_LOGW(TAG, "Failed to save setting '%s': %s", item->string, e.what());
                 }
             }
         }
@@ -658,14 +723,35 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
             return ESP_FAIL;
         }
 
-        // 获取所有键值对 (这里需要拓展Settings类功能，简化示例)
-        // 实际应用中，您可能需要读取指定的键
+        // 获取实际设备音量
+        auto codec = Board::GetInstance().GetAudioCodec();
+        if (codec)
+        {
+            try
+            {
+                int current_volume = codec->output_volume();
+                cJSON_AddNumberToObject(config, "volume", current_volume);
+                ESP_LOGI(TAG, "Current device volume: %d", current_volume);
+            }
+            catch (const std::exception &e)
+            {
+                ESP_LOGW(TAG, "Failed to get device volume: %s", e.what());
+                // 如果获取失败，尝试从配置中读取
+                int saved_volume = custom_settings.GetInt("volume", 50);
+                cJSON_AddNumberToObject(config, "volume", saved_volume);
+            }
+        }
+
+        // 动态获取所有自定义配置
         std::vector<std::string> keys = custom_settings.GetAllKeys();
         for (const auto &key : keys)
         {
+            // 跳过 volume，因为我们已经从设备读取了实际值
+            if (key == "volume")
+                continue;
+
             if (custom_settings.Contains(key))
             {
-                // 尝试不同类型读取
                 if (custom_settings.IsString(key))
                 {
                     cJSON_AddStringToObject(config, key.c_str(), custom_settings.GetString(key, "").c_str());
@@ -717,6 +803,56 @@ static esp_err_t HandleJsonMessage(int sock, const char *message)
             }
             cJSON_Delete(response);
         }
+    }
+    else if (strcmp(type->valuestring, "reboot") == 0)
+    {
+        // 创建响应
+        cJSON *response = cJSON_CreateObject();
+        if (response)
+        {
+            cJSON_AddStringToObject(response, "type", "reboot_response");
+            cJSON_AddBoolToObject(response, "success", true);
+
+            // 发送响应
+            char *json_str = cJSON_PrintUnformatted(response);
+            if (json_str)
+            {
+                // 发送响应并检查结果
+                if (SendWebSocketMessage(sock, json_str, strlen(json_str)) == ESP_OK)
+                {
+                    free(json_str);
+                    cJSON_Delete(response);
+                    cJSON_Delete(root);
+
+                    // 延迟一小段时间确保响应发送完成
+                    vTaskDelay(pdMS_TO_TICKS(500));
+
+                    // 创建一个独立的任务来执行重启
+                    xTaskCreate([](void *)
+                                {
+                        // 停止 WebSocket 服务器
+                        LocalWebsocketServer::GetInstance().Stop();
+                        
+                        // 停止 WiFi
+                        WifiStation::GetInstance().Stop();
+                        
+                        // 延迟以确保所有资源都被正确释放
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        
+                        // 重启设备
+                        esp_restart();
+                        
+                        vTaskDelete(NULL); },
+                                "reboot_task", 4096, nullptr, 5, nullptr);
+
+                    return ESP_OK;
+                }
+                free(json_str);
+            }
+            cJSON_Delete(response);
+        }
+        cJSON_Delete(root);
+        return ESP_FAIL;
     }
     else
     {

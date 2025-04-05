@@ -2,6 +2,7 @@
 #include "board.h"
 #include "system_info.h"
 #include "application.h"
+#include "settings.h"
 
 #include <cstring>
 #include <cJSON.h>

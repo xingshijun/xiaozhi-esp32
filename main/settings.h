@@ -31,6 +31,17 @@ private:
     nvs_handle_t nvs_handle_ = 0;
     bool read_write_ = false;
     bool dirty_ = false;
+
+    // 添加 ValueType 枚举定义
+    enum class ValueType {
+        String,
+        Int,
+        Bool,
+        Unknown
+    };
+    
+    // 添加 GetValueType 方法声明
+    ValueType GetValueType(const std::string& key);
 };
 
 #endif

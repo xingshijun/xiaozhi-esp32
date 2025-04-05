@@ -126,42 +126,45 @@ std::vector<std::string> Settings::GetAllKeys() {
     return keys;
 }
 
-bool Settings::Contains(const std::string& key) {
+Settings::ValueType Settings::GetValueType(const std::string& key) {
     if (nvs_handle_ == 0) {
-        return false;
+        return ValueType::Unknown;
     }
+    
+    size_t required_size;
+    
+    // 尝试获取字符串长度
+    if (nvs_get_str(nvs_handle_, key.c_str(), nullptr, &required_size) == ESP_OK) {
+        return ValueType::String;
+    }
+    
+    // 尝试获取整数
+    int32_t value;
+    if (nvs_get_i32(nvs_handle_, key.c_str(), &value) == ESP_OK) {
+        return ValueType::Int;
+    }
+    
+    // 尝试获取布尔值
+    uint8_t bool_value;
+    if (nvs_get_u8(nvs_handle_, key.c_str(), &bool_value) == ESP_OK) {
+        return ValueType::Bool;
+    }
+    
+    return ValueType::Unknown;
+}
 
-    nvs_type_t type;
-    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
-    return res == ESP_OK;
+bool Settings::Contains(const std::string& key) {
+    return GetValueType(key) != ValueType::Unknown;
 }
 
 bool Settings::IsString(const std::string& key) {
-    if (nvs_handle_ == 0) {
-        return false;
-    }
-
-    nvs_type_t type;
-    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
-    return res == ESP_OK && type == NVS_TYPE_STR;
+    return GetValueType(key) == ValueType::String;
 }
 
 bool Settings::IsInt(const std::string& key) {
-    if (nvs_handle_ == 0) {
-        return false;
-    }
-
-    nvs_type_t type;
-    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
-    return res == ESP_OK && type == NVS_TYPE_I32;
+    return GetValueType(key) == ValueType::Int;
 }
 
 bool Settings::IsBool(const std::string& key) {
-    if (nvs_handle_ == 0) {
-        return false;
-    }
-
-    nvs_type_t type;
-    esp_err_t res = nvs_get_type(nvs_handle_, key.c_str(), &type);
-    return res == ESP_OK && type == NVS_TYPE_U8;
+    return GetValueType(key) == ValueType::Bool;
 }
